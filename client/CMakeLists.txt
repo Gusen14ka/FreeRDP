@@ -62,6 +62,11 @@ if(FREERDP_VENDOR AND WITH_CLIENT)
   if(ANDROID)
     message(STATUS "Android client module is built with Android Studio project")
   endif()
+
+  option(WITH_CLIENT_QUIC "Build QUIC multiplexed client" ON)
+  if(WITH_CLIENT_QUIC)
+    add_subdirectory(quic)
+  endif()
 endif()
 
 # Pick up other clients
