@@ -200,7 +200,7 @@ static BOOL quicmux_plugin_unload(proxyPlugin* plugin)
     return TRUE;
 }
 
-BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
 {
     proxyPlugin plugin = { 0 };
     quicmux_data* data = calloc(1, sizeof(quicmux_data));
@@ -230,5 +230,15 @@ BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userda
     plugin.userdata = userdata;
 
     return plugins_manager->RegisterPlugin(plugins_manager, &plugin);
+}
+
+/* На случай, если модуль когда-нибудь статически слинкуют в сам freerdp-proxy —
+ * именно эту версию имени ищет pf_modules_load_static_module. Не обязательно
+ * для нашего текущего сценария (мы всегда грузимся как внешний .so), но
+ * следуя тому же паттерну, что и demo/bitmap-filter/dyn-channel-dump модули. */
+FREERDP_API BOOL quicmux_proxy_module_entry_point(proxyPluginsManager* plugins_manager,
+                                                   void* userdata)
+{
+    return proxy_module_entry_point(plugins_manager, userdata);
 }
 
