@@ -70,15 +70,19 @@ static BOOL quic_client_post_connect(freerdp* instance)
 
     fprintf(stderr, "[client] PostConnect: устанавливаем QUIC транспорт\n");
 
-    /*
-     * Здесь TLS handshake уже завершён и соединение установлено.
-     * Подменяем ReadPdu/WritePdu на наши реализации.
-     * С этого момента весь трафик идёт через Unix сокеты → QUIC.
-     */
     if (!quic_transport_install(instance, ctx->bridge)) {
         fprintf(stderr, "[client] ОШИБКА: не могу установить QUIC транспорт\n");
         return FALSE;
     }
+
+    /* Сигнал Go-клиенту: негоциация реально завершена, хуки встали —
+     * можно переключаться на мультиплексированные QUIC-стримы. */
+    const uint8_t ready_marker[] = "QUICMUX_READY";
+    if (quic_bridge_write(ctx->bridge, QUIC_CHANNEL_CONTROL,
+                           ready_marker, sizeof(ready_marker) - 1) < 0) {
+        fprintf(stderr, "[client] ОШИБКА: не удалось отправить READY маркер\n");
+        return FALSE;
+                           }
 
     fprintf(stderr, "[client] QUIC транспорт активен\n");
     return TRUE;
