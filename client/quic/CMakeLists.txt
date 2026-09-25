@@ -10,6 +10,7 @@ add_executable(xfreerdp-quic
 target_link_libraries(xfreerdp-quic
         PRIVATE
         freerdp-client
+        xfreerdp-client
         freerdp
         winpr
 )

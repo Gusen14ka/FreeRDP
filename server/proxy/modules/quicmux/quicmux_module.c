@@ -96,6 +96,8 @@ static BOOL quicmux_dyn_channel_intercept(proxyPlugin* plugin, proxyData* pdata,
 
     const BYTE* buf = Stream_Buffer(event->data);
     size_t len = event->packetSize;
+    fprintf(stderr, "[quicmux][GFX] isBackData=%d len=%zu first_bytes=%02x %02x %02x %02x\n",
+        event->isBackData, len, buf[0], buf[1], buf[2], buf[3]);
 
     /* GFX-канал двунаправленный (графика от таргета + ack/капабилити от клиента),
      * но обе стороны логически относятся к "графике" — пишем в один и тот же
