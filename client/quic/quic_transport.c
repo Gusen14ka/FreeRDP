@@ -136,9 +136,19 @@ static int quic_read_pdu(rdpTransport* transport, wStream* s)
         (QuicBridgeContext*)freerdp_get_io_callback_context(context);
     if (!bridge) return -1;
 
+    /* Порядок опроса по приоритету: служебные PDU всегда вперёд графики.
+     * Фаза финализации RDP (Synchronize/Control/FontMap) требует строгого
+     * порядка, а графика может её обогнать и сорвать активацию. */
+    static const QuicChannel poll_order[QUIC_CHANNEL_COUNT] = {
+        QUIC_CHANNEL_CONTROL,
+        QUIC_CHANNEL_VCHANNEL,
+        QUIC_CHANNEL_INPUT,
+        QUIC_CHANNEL_GRAPHICS
+    };
+
     struct pollfd fds[QUIC_CHANNEL_COUNT];
     for (int i = 0; i < QUIC_CHANNEL_COUNT; i++) {
-        fds[i].fd      = bridge->fds[i];
+        fds[i].fd      = bridge->fds[poll_order[i]];
         fds[i].events  = POLLIN;
         fds[i].revents = 0;
     }
@@ -150,12 +160,13 @@ static int quic_read_pdu(rdpTransport* transport, wStream* s)
     for (int i = 0; i < QUIC_CHANNEL_COUNT; i++) {
         if (!(fds[i].revents & POLLIN)) continue;
 
+        QuicChannel ch = poll_order[i];
+
         if (!Stream_EnsureCapacity(s, READ_BUF_SIZE))
             return -1;
 
         uint8_t* buf = Stream_Buffer(s);
-        int n = quic_bridge_read(bridge, (QuicChannel)i,
-                                 buf, READ_BUF_SIZE);
+        int n = quic_bridge_read(bridge, ch, buf, READ_BUF_SIZE);
         if (n < 0) return -1;
         if (n == 0) continue;
 
@@ -163,8 +174,7 @@ static int quic_read_pdu(rdpTransport* transport, wStream* s)
         Stream_SealLength(s);
         Stream_ResetPosition(s);
 
-        fprintf(stderr, "[quic_read] channel=%-9s len=%d\n",
-                QUIC_CHANNEL_NAMES[i], n);
+        fprintf(stderr, "[quic_read] channel=%-9s len=%d\n", QUIC_CHANNEL_NAMES[ch], n);
         return n;
     }
     return 0;
