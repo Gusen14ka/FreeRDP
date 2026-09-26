@@ -1,4 +1,5 @@
 #include <string.h>
+#include <poll.h>
 #include <freerdp/api.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/input.h>
@@ -8,6 +9,7 @@
 #include <winpr/stream.h>
 #include "quic_bridge.h"
 #include "quic_transport.h"
+
 
 #define TAG MODULE_TAG("quicmux")
 
@@ -53,6 +55,57 @@ static int quicmux_ps_write_pdu(rdpTransport* transport, wStream* s)
 	return 1;
 }
 
+static int quicmux_ps_read_pdu(rdpTransport* transport, wStream* s)
+{
+	rdpContext* context = transport_get_context(transport);
+	QuicBridgeContext* bridge =
+	    (QuicBridgeContext*)freerdp_get_io_callback_context(context);
+	if (!bridge)
+		return -1;
+
+	/* Служебные каналы вперёд графики: фаза финализации чувствительна
+	 * к порядку, а graphics может её обогнать */
+	static const QuicChannel poll_order[QUIC_CHANNEL_COUNT] = {
+		QUIC_CHANNEL_CONTROL, QUIC_CHANNEL_VCHANNEL,
+		QUIC_CHANNEL_INPUT, QUIC_CHANNEL_GRAPHICS
+	};
+
+	struct pollfd fds[QUIC_CHANNEL_COUNT];
+	for (int i = 0; i < QUIC_CHANNEL_COUNT; i++)
+	{
+		fds[i].fd = bridge->fds[poll_order[i]];
+		fds[i].events = POLLIN;
+		fds[i].revents = 0;
+	}
+
+	int ready = poll(fds, QUIC_CHANNEL_COUNT, 100);
+	if (ready < 0)  return -1;
+	if (ready == 0) return 0;
+
+	for (int i = 0; i < QUIC_CHANNEL_COUNT; i++)
+	{
+		if (!(fds[i].revents & POLLIN)) continue;
+
+		QuicChannel ch = poll_order[i];
+
+		if (!Stream_EnsureCapacity(s, 64 * 1024))
+			return -1;
+
+		uint8_t* buf = Stream_Buffer(s);
+		int n = quic_bridge_read(bridge, ch, buf, 64 * 1024);
+		if (n < 0) return -1;
+		if (n == 0) continue;
+
+		Stream_SetPosition(s, n);
+		Stream_SealLength(s);
+		Stream_ResetPosition(s);
+
+		WLog_DBG(TAG, "ps read: канал %s, %d байт", QUIC_CHANNEL_NAMES[ch], n);
+		return n;
+	}
+	return 0;
+}
+
 static BOOL quicmux_server_post_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
 {
 	quicmux_data* data = (quicmux_data*)plugin->custom;
@@ -71,6 +124,7 @@ static BOOL quicmux_server_post_connect(proxyPlugin* plugin, proxyData* pdata, v
 	rdpTransportIo io;
 	memcpy(&io, defaults, sizeof(io));
 	io.WritePdu = quicmux_ps_write_pdu;
+	io.ReadPdu  = quicmux_ps_read_pdu;
 
 	if (!freerdp_set_io_callbacks(context, &io))
 	{
@@ -265,7 +319,7 @@ FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, 
 	plugin.ServerSessionStarted = quicmux_server_session_started;
 	plugin.ServerSessionEnd = quicmux_server_session_end;
 	plugin.ServerPostConnect = quicmux_server_post_connect;
-	plugin.ClientPostConnect = quicmux_client_post_connect;
+	//plugin.ClientPostConnect = quicmux_client_post_connect;
 
 	plugin.custom = data;
 	plugin.userdata = userdata;
