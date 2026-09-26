@@ -16,6 +16,7 @@ include(CommonConfigOptions)
 set(SRCS
         quicmux_module.c
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../client/quic/quic_bridge.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../client/quic/quic_transport.c
 )
 
 addtargetwithresourcefile(${PROJECT_NAME} FALSE "${PROJECT_VERSION}" SRCS FALSE)
