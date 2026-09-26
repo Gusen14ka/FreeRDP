@@ -249,7 +249,7 @@ static BOOL quicmux_plugin_unload(proxyPlugin* plugin)
 	return TRUE;
 }
 
-BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
 {
 	proxyPlugin plugin = { 0 };
 	quicmux_data* data = calloc(1, sizeof(quicmux_data));
