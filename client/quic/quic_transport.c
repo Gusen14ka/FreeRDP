@@ -153,7 +153,7 @@ static int quic_read_pdu(rdpTransport* transport, wStream* s)
         fds[i].revents = 0;
     }
 
-    int ready = poll(fds, QUIC_CHANNEL_COUNT, 100);
+    int ready = poll(fds, QUIC_CHANNEL_COUNT, 0);
     if (ready < 0)  return -1;
     if (ready == 0) return 0;
 
