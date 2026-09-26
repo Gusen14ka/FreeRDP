@@ -16,6 +16,8 @@
 
 #include <freerdp/freerdp.h>
 #include <freerdp/client.h>
+#include <freerdp/channels/channels.h>
+#include <winpr/synch.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,17 @@
 
 #include "quic_bridge.h"
 #include "quic_transport.h"
+
+static HANDLE g_bridge_events[QUIC_CHANNEL_COUNT] = { 0 };
+
+/* Хендл нужен только чтобы разбудить цикл. Само чтение сделает
+ * transport_check_fds → quic_read_pdu на следующем проходе. */
+static BOOL quic_bridge_event_cb(rdpContext* context, void* userdata)
+{
+    (void)context;
+    (void)userdata;
+    return TRUE;
+}
 
 /* Глобально для signal handler */
 static freerdp* g_instance = NULL;
@@ -93,6 +106,21 @@ static BOOL quic_client_post_connect(freerdp* instance)
         return FALSE;
     }
 
+    for (int i = 0; i < QUIC_CHANNEL_COUNT; i++) {
+        g_bridge_events[i] = CreateFileDescriptorEvent(NULL, FALSE, FALSE,
+                                                       bridge->fds[i], WINPR_FD_READ);
+        if (!g_bridge_events[i]) {
+            fprintf(stderr, "[client] ОШИБКА: хендл для канала %s\n", QUIC_CHANNEL_NAMES[i]);
+            return FALSE;
+        }
+        if (!freerdp_client_channel_register(instance->context->channels,
+                                             g_bridge_events[i], quic_bridge_event_cb, NULL)) {
+            fprintf(stderr, "[client] ОШИБКА: не удалось зарегистрировать хендл %s\n",
+                    QUIC_CHANNEL_NAMES[i]);
+            return FALSE;
+                                             }
+    }
+
     const uint8_t ready_marker[] = "QUICMUX_READY";
     if (quic_bridge_write(bridge, QUIC_CHANNEL_CONTROL,
                            ready_marker, sizeof(ready_marker) - 1) < 0) {
@@ -106,6 +134,14 @@ static BOOL quic_client_post_connect(freerdp* instance)
 
 static void quic_client_post_disconnect(freerdp* instance)
 {
+    for (int i = 0; i < QUIC_CHANNEL_COUNT; i++) {
+        if (g_bridge_events[i]) {
+            freerdp_client_channel_unregister(instance->context->channels, g_bridge_events[i]);
+            CloseHandle(g_bridge_events[i]);
+            g_bridge_events[i] = NULL;
+        }
+    }
+
     fprintf(stderr, "[client] PostDisconnect\n");
     if (orig_post_disconnect)
         orig_post_disconnect(instance);
