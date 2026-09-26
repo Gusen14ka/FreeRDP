@@ -1,246 +1,280 @@
+#include <string.h>
 #include <freerdp/api.h>
+#include <freerdp/freerdp.h>
+#include <freerdp/input.h>
+#include <freerdp/transport_io.h>
 #include <freerdp/server/proxy/proxy_modules_api.h>
-#include <freerdp/channels/rdpgfx.h>   /* RDPGFX_DVC_CHANNEL_NAME */
+#include <freerdp/server/proxy/proxy_context.h>
 #include <winpr/stream.h>
-#include "quic_bridge.h"   /* переиспользуем 1:1 из client/quic, без изменений */
+#include "quic_bridge.h"
+#include "quic_transport.h"
 
 #define TAG MODULE_TAG("quicmux")
 
 typedef struct
 {
-    proxyPluginsManager* mgr;
-    QuicBridgeContext* bridge;      /* тот же тип, что уже используется в quic_client.c */
+	proxyPluginsManager* mgr;
+	QuicBridgeContext* bridge;
+	HANDLE input_thread;
+	BOOL running;
 } quicmux_data;
 
 static const char plugin_name[] = "quicmux";
-static const char plugin_desc[] = "Demultiplexes RDP traffic into unix-socket channels for QUIC bridge";
+static const char plugin_desc[] = "Transport-level RDP demux into unix-socket channels for QUIC bridge";
 
-/* --- сериализация input-событий в канал "input" --- */
+/* ===================== ps -> клиент: вся графика и служебные PDU ===================== */
 
-/* Формат на проводе внутри канала input:
- *   [1B type][варьируется по типу]
- * type: 0x01 = keyboard, 0x02 = unicode, 0x03 = mouse, 0x04 = mouse_ex
- * Выбрал так, а не "как есть share-data PDU", потому что данные
- * сюда приходят уже разобранными FreeRDP (flags/code напрямую),
- * ре-упаковывать их в фейковый RDP PDU не нужно — на другом конце
- * (xfreerdp-quic) мы всё равно не PDU ждём, а такой же явный ввод,
- * который потом сами же и восстановим в PDU через freerdp_input_send_*.
- */
-
-static BOOL quicmux_keyboard_event(proxyPlugin* plugin, proxyData* pdata, void* param)
+static int quicmux_ps_write_pdu(rdpTransport* transport, wStream* s)
 {
-    const proxyKeyboardEventInfo* event = (const proxyKeyboardEventInfo*)param;
-    quicmux_data* data = (quicmux_data*)plugin->custom;
+	rdpContext* context = transport_get_context(transport);
+	QuicBridgeContext* bridge =
+	    (QuicBridgeContext*)freerdp_get_io_callback_context(context);
 
-    BYTE buf[4];
-    buf[0] = 0x01;
-    buf[1] = (BYTE)(event->flags & 0xFF);
-    buf[2] = (BYTE)((event->flags >> 8) & 0xFF);
-    buf[3] = event->rdp_scan_code;
+	const uint8_t* buf = Stream_Buffer(s);
+	size_t len = Stream_Length(s);
+	if (len == 0)
+		return 0;
 
-    if (quic_bridge_write(data->bridge, QUIC_CHANNEL_INPUT, buf, sizeof(buf)) < 0)
-    {
-        WLog_ERR(TAG, "не удалось записать keyboard-событие в мост");
-        /* fail-safe: пропускаем как обычно, чтобы сессия не встала колом */
-        return TRUE;
-    }
+	/* Направление ps->клиент зеркально клиентскому: fast-path здесь всегда
+	 * графика (сервер по fast-path шлёт только обновления экрана/курсора) */
+	QuicChannel ch;
+	if ((buf[0] & 0x03) == 0x00)
+		ch = QUIC_CHANNEL_GRAPHICS;
+	else
+		ch = quic_transport_classify_pdu(buf, len);
 
-    return FALSE; /* поглощаем событие — родная пересылка в pc отключена */
+	if (quic_bridge_write(bridge, ch, buf, (uint32_t)len) < 0)
+	{
+		WLog_ERR(TAG, "не удалось записать исходящий PDU в мост (канал %s)",
+		         QUIC_CHANNEL_NAMES[ch]);
+		return -1;
+	}
+
+	return 1;
 }
 
-static BOOL quicmux_mouse_event(proxyPlugin* plugin, proxyData* pdata, void* param)
+static BOOL quicmux_server_post_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
 {
-    const proxyMouseEventInfo* event = (const proxyMouseEventInfo*)param;
-    quicmux_data* data = (quicmux_data*)plugin->custom;
+	quicmux_data* data = (quicmux_data*)plugin->custom;
+	pServerContext* ps = proxy_data_get_server_context(pdata);
+	rdpContext* context = (rdpContext*)ps;
 
-    BYTE buf[7];
-    buf[0] = 0x03;
-    buf[1] = (BYTE)(event->flags & 0xFF);
-    buf[2] = (BYTE)((event->flags >> 8) & 0xFF);
-    buf[3] = (BYTE)(event->x & 0xFF);
-    buf[4] = (BYTE)((event->x >> 8) & 0xFF);
-    buf[5] = (BYTE)(event->y & 0xFF);
-    buf[6] = (BYTE)((event->y >> 8) & 0xFF);
+	freerdp_set_io_callback_context(context, data->bridge);
 
-    if (quic_bridge_write(data->bridge, QUIC_CHANNEL_INPUT, buf, sizeof(buf)) < 0)
-        return TRUE;
+	const rdpTransportIo* defaults = freerdp_get_io_callbacks(context);
+	if (!defaults)
+	{
+		WLog_ERR(TAG, "не удалось получить дефолтные io callbacks у ps");
+		return FALSE;
+	}
 
-    return FALSE;
+	rdpTransportIo io;
+	memcpy(&io, defaults, sizeof(io));
+	io.WritePdu = quicmux_ps_write_pdu;
+
+	if (!freerdp_set_io_callbacks(context, &io))
+	{
+		WLog_ERR(TAG, "не удалось установить io callbacks на ps");
+		return FALSE;
+	}
+
+	WLog_INFO(TAG, "транспорт ps перехвачен — графика/служебные PDU идут в мост");
+	return TRUE;
 }
 
-/* ===================== GFX / графика (dynamic channel) ===================== */
+/* ===================== парсер Fast-Path Input PDU (MS-RDPBCGR 2.2.8.1.2) ===================== */
 
-static BOOL quicmux_dyn_channel_to_intercept(proxyPlugin* plugin, proxyData* pdata, void* arg)
+#define FASTPATH_INPUT_EVENT_SCANCODE 0x0
+#define FASTPATH_INPUT_EVENT_MOUSE    0x1
+#define FASTPATH_INPUT_EVENT_MOUSEX   0x2
+#define FASTPATH_INPUT_EVENT_SYNC     0x3
+#define FASTPATH_INPUT_EVENT_UNICODE  0x4
+#define FASTPATH_INPUT_EVENT_QOE_TS   0x6
+
+static void quicmux_dispatch_fastpath_input(rdpInput* input, const uint8_t* buf, size_t len)
 {
-    proxyChannelToInterceptData* data = (proxyChannelToInterceptData*)arg;
+	if (len < 1)
+		return;
 
-    /* помечаем GFX-канал на перехват; остальные dynamic-каналы (audio/video/camera
-     * redirection и т.д.) не трогаем — они и так идут по обычному пути прокси,
-     * можно будет добавить их сюда же в будущем при необходимости */
-    if (strcmp(data->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
-        data->intercept = TRUE;
+	uint8_t header0 = buf[0];
+	size_t numEvents = (header0 >> 2) & 0x0F;
+	size_t pos = 1;
 
-    return TRUE;
+	for (size_t i = 0; i < numEvents && pos < len; i++)
+	{
+		uint8_t eventHeader = buf[pos++];
+		uint8_t eventCode = (eventHeader >> 5) & 0x07;
+
+		switch (eventCode)
+		{
+			case FASTPATH_INPUT_EVENT_SCANCODE:
+			{
+				if (pos + 1 > len) return;
+				uint8_t flags = eventHeader & 0x1F;
+				uint8_t code = buf[pos++];
+				UINT16 rdpFlags = 0;
+				if (flags & 0x01) rdpFlags |= KBD_FLAGS_EXTENDED;
+				if (flags & 0x02) rdpFlags |= KBD_FLAGS_RELEASE; else rdpFlags |= KBD_FLAGS_DOWN;
+				freerdp_input_send_keyboard_event(input, rdpFlags, code);
+				break;
+			}
+			case FASTPATH_INPUT_EVENT_MOUSE:
+			{
+				if (pos + 6 > len) return;
+				UINT16 pflags = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				UINT16 x = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				UINT16 y = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				freerdp_input_send_mouse_event(input, pflags, x, y);
+				break;
+			}
+			case FASTPATH_INPUT_EVENT_MOUSEX:
+			{
+				if (pos + 6 > len) return;
+				UINT16 pflags = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				UINT16 x = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				UINT16 y = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				freerdp_input_send_extended_mouse_event(input, pflags, x, y);
+				break;
+			}
+			case FASTPATH_INPUT_EVENT_UNICODE:
+			{
+				if (pos + 2 > len) return;
+				UINT16 code = (UINT16)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+				freerdp_input_send_unicode_keyboard_event(input, 0, code);
+				break;
+			}
+			case FASTPATH_INPUT_EVENT_SYNC:
+			case FASTPATH_INPUT_EVENT_QOE_TS:
+			default:
+				break;
+		}
+	}
 }
 
-static BOOL quicmux_dyn_channel_intercept(proxyPlugin* plugin, proxyData* pdata, void* arg)
+/* ===================== клиент -> pc: ввод ===================== */
+
+static DWORD WINAPI quicmux_input_thread(LPVOID arg)
 {
-    proxyDynChannelInterceptData* event = (proxyDynChannelInterceptData*)arg;
-    quicmux_data* data = (quicmux_data*)plugin->custom;
+	proxyData* pdata = (proxyData*)arg;
+	pClientContext* pc = proxy_data_get_client_context(pdata);
+	rdpContext* context = (rdpContext*)pc;
+	QuicBridgeContext* bridge =
+	    (QuicBridgeContext*)freerdp_get_io_callback_context(context);
 
-    if (strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) != 0)
-    {
-        event->result = PF_CHANNEL_RESULT_PASS;
-        return TRUE;
-    }
+	rdpInput* input = context->input;
 
-    const BYTE* buf = Stream_Buffer(event->data);
-    size_t len = event->packetSize;
-    fprintf(stderr, "[quicmux][GFX] isBackData=%d len=%zu first_bytes=%02x %02x %02x %02x\n",
-        event->isBackData, len, buf[0], buf[1], buf[2], buf[3]);
+	uint8_t buf[64 * 1024];
+	while (!proxy_data_shall_disconnect(pdata))
+	{
+		int n = quic_bridge_read(bridge, QUIC_CHANNEL_INPUT, buf, sizeof(buf));
+		if (n < 0)
+			break;
+		if (n == 0)
+			continue;
 
-    /* GFX-канал двунаправленный (графика от таргета + ack/капабилити от клиента),
-     * но обе стороны логически относятся к "графике" — пишем в один и тот же
-     * unix-канал graphics независимо от event->isBackData */
-    if (quic_bridge_write(data->bridge, QUIC_CHANNEL_GRAPHICS, buf, len) < 0)
-    {
-        WLog_ERR(TAG, "не удалось записать GFX-пакет в мост");
-        event->result = PF_CHANNEL_RESULT_ERROR;
-        return TRUE;
-    }
+		quicmux_dispatch_fastpath_input(input, buf, (size_t)n);
+	}
 
-    event->result = PF_CHANNEL_RESULT_DROP; /* поглощаем — родная пересылка отключена */
-    return TRUE;
+	return 0;
 }
 
-/* ===================== статические virtual channels (cliprdr/rdpdr/rdpsnd...) ===================== */
-
-/* Формат в unix-канале vchannel: [2B channel_id LE][4B data_len LE][data...]
- * channel_id обязателен: в отличие от input/graphics, тут внутри ОДНОГО
- * unix-канала реально мультиплексируется НЕСКОЛЬКО разных RDP-каналов —
- * без id на другом конце нечем будет их различить при восстановлении. */
-static BOOL quicmux_write_vchannel(quicmux_data* data, UINT16 channel_id,
-                                    const BYTE* payload, size_t len)
+static BOOL quicmux_client_post_connect(proxyPlugin* plugin, proxyData* pdata, void* custom)
 {
-    BYTE hdr[6];
-    hdr[0] = (BYTE)(channel_id & 0xFF);
-    hdr[1] = (BYTE)((channel_id >> 8) & 0xFF);
-    hdr[2] = (BYTE)(len & 0xFF);
-    hdr[3] = (BYTE)((len >> 8) & 0xFF);
-    hdr[4] = (BYTE)((len >> 16) & 0xFF);
-    hdr[5] = (BYTE)((len >> 24) & 0xFF);
+	quicmux_data* data = (quicmux_data*)plugin->custom;
+	pClientContext* pc = proxy_data_get_client_context(pdata);
+	rdpContext* context = (rdpContext*)pc;
 
-    if (quic_bridge_write(data->bridge, QUIC_CHANNEL_VCHANNEL, hdr, sizeof(hdr)) < 0)
-        return FALSE;
-    if (len > 0 && quic_bridge_write(data->bridge, QUIC_CHANNEL_VCHANNEL, payload, len) < 0)
-        return FALSE;
-    return TRUE;
+	freerdp_set_io_callback_context(context, data->bridge);
+
+	data->input_thread = CreateThread(NULL, 0, quicmux_input_thread, pdata, 0, NULL);
+	if (!data->input_thread)
+	{
+		WLog_ERR(TAG, "не удалось запустить поток ввода");
+		return FALSE;
+	}
+
+	WLog_INFO(TAG, "поток чтения input-канала запущен для pc");
+	return TRUE;
 }
 
-static BOOL quicmux_client_channel_data(proxyPlugin* plugin, proxyData* pdata, void* param)
-{
-    const proxyChannelDataEventInfo* channel = (const proxyChannelDataEventInfo*)param;
-    quicmux_data* data = (quicmux_data*)plugin->custom;
-
-    if (!quicmux_write_vchannel(data, channel->channel_id, channel->data, channel->data_len))
-        return TRUE; /* fail-safe: пропускаем как обычно при сбое моста, не рвём сессию */
-
-    return FALSE;
-}
-
-static BOOL quicmux_server_channel_data(proxyPlugin* plugin, proxyData* pdata, void* param)
-{
-    const proxyChannelDataEventInfo* channel = (const proxyChannelDataEventInfo*)param;
-    quicmux_data* data = (quicmux_data*)plugin->custom;
-
-    if (!quicmux_write_vchannel(data, channel->channel_id, channel->data, channel->data_len))
-        return TRUE;
-
-    return FALSE;
-}
-
-/* --- жизненный цикл: открываем/закрываем мост вместе с сессией --- */
+/* ===================== жизненный цикл ===================== */
 
 static BOOL quicmux_server_session_started(proxyPlugin* plugin, proxyData* pdata, void* custom)
 {
-    quicmux_data* data = (quicmux_data*)plugin->custom;
+	quicmux_data* data = (quicmux_data*)plugin->custom;
 
-    data->bridge = quic_bridge_new();
-    if (!data->bridge)
-    {
-        WLog_ERR(TAG, "не удалось создать контекст моста");
-        return FALSE;
-    }
+	data->bridge = quic_bridge_new();
+	if (!data->bridge)
+	{
+		WLog_ERR(TAG, "не удалось создать контекст моста");
+		return FALSE;
+	}
 
-    if (quic_bridge_connect(data->bridge) != 0)
-    {
-        WLog_ERR(TAG, "не удалось подключиться к unix-мосту");
-        quic_bridge_free(data->bridge);
-        data->bridge = NULL;
-        return FALSE;
-    }
+	if (quic_bridge_connect(data->bridge) != 0)
+	{
+		WLog_ERR(TAG, "не удалось подключиться к unix-мосту");
+		quic_bridge_free(data->bridge);
+		data->bridge = NULL;
+		return FALSE;
+	}
 
-    WLog_INFO(TAG, "quic-мост подключен для новой сессии");
-    return TRUE;
+	data->running = TRUE;
+	WLog_INFO(TAG, "quic-мост подключен для новой сессии");
+	return TRUE;
 }
 
 static BOOL quicmux_server_session_end(proxyPlugin* plugin, proxyData* pdata, void* custom)
 {
-    quicmux_data* data = (quicmux_data*)plugin->custom;
-    if (data->bridge)
-    {
-        quic_bridge_free(data->bridge);   /* было: quic_bridge_close(...) */
-        data->bridge = NULL;
-    }
-    return TRUE;
+	quicmux_data* data = (quicmux_data*)plugin->custom;
+
+	data->running = FALSE;
+	if (data->input_thread)
+	{
+		WaitForSingleObject(data->input_thread, 2000);
+		CloseHandle(data->input_thread);
+		data->input_thread = NULL;
+	}
+	if (data->bridge)
+	{
+		quic_bridge_free(data->bridge);
+		data->bridge = NULL;
+	}
+	return TRUE;
 }
 
 static BOOL quicmux_plugin_unload(proxyPlugin* plugin)
 {
-    if (plugin && plugin->custom)
-        free(plugin->custom);
-    return TRUE;
+	if (plugin && plugin->custom)
+		free(plugin->custom);
+	return TRUE;
 }
 
-FREERDP_API BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
+BOOL proxy_module_entry_point(proxyPluginsManager* plugins_manager, void* userdata)
 {
-    proxyPlugin plugin = { 0 };
-    quicmux_data* data = calloc(1, sizeof(quicmux_data));
-    if (!data)
-        return FALSE;
+	proxyPlugin plugin = { 0 };
+	quicmux_data* data = calloc(1, sizeof(quicmux_data));
+	if (!data)
+		return FALSE;
 
-    data->mgr = plugins_manager;
-    data->bridge = NULL;
+	data->mgr = plugins_manager;
 
-    plugin.name = plugin_name;
-    plugin.description = plugin_desc;
-    plugin.PluginUnload = quicmux_plugin_unload;
+	plugin.name = plugin_name;
+	plugin.description = plugin_desc;
+	plugin.PluginUnload = quicmux_plugin_unload;
 
-    plugin.ServerSessionStarted = quicmux_server_session_started;
-    plugin.ServerSessionEnd = quicmux_server_session_end;
+	plugin.ServerSessionStarted = quicmux_server_session_started;
+	plugin.ServerSessionEnd = quicmux_server_session_end;
+	plugin.ServerPostConnect = quicmux_server_post_connect;
+	plugin.ClientPostConnect = quicmux_client_post_connect;
 
-    plugin.KeyboardEvent = quicmux_keyboard_event;
-    plugin.MouseEvent = quicmux_mouse_event;
-    /* UnicodeEvent/MouseExEvent — по аналогии, добавим при желании отдельно */
+	plugin.custom = data;
+	plugin.userdata = userdata;
 
-    plugin.DynChannelToIntercept = quicmux_dyn_channel_to_intercept;
-    plugin.DynChannelIntercept   = quicmux_dyn_channel_intercept;
-    plugin.ClientChannelData     = quicmux_client_channel_data;
-    plugin.ServerChannelData     = quicmux_server_channel_data;
-
-    plugin.custom = data;
-    plugin.userdata = userdata;
-
-    return plugins_manager->RegisterPlugin(plugins_manager, &plugin);
+	return plugins_manager->RegisterPlugin(plugins_manager, &plugin);
 }
 
-/* На случай, если модуль когда-нибудь статически слинкуют в сам freerdp-proxy —
- * именно эту версию имени ищет pf_modules_load_static_module. Не обязательно
- * для нашего текущего сценария (мы всегда грузимся как внешний .so), но
- * следуя тому же паттерну, что и demo/bitmap-filter/dyn-channel-dump модули. */
 FREERDP_API BOOL quicmux_proxy_module_entry_point(proxyPluginsManager* plugins_manager,
                                                    void* userdata)
 {
-    return proxy_module_entry_point(plugins_manager, userdata);
+	return proxy_module_entry_point(plugins_manager, userdata);
 }
-
