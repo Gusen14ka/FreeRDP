@@ -163,69 +163,60 @@ static void quic_wrapped_context_free(freerdp* instance, rdpContext* context)
 
 int main(int argc, char** argv)
 {
-    int exit_code = 1;
+    int rc = 1;
 
-    RDP_CLIENT_ENTRY_POINTS entry_points = { 0 };
-    entry_points.Size = sizeof(RDP_CLIENT_ENTRY_POINTS);
-    entry_points.Version = RDP_CLIENT_INTERFACE_VERSION;
-    RdpClientEntry(&entry_points);
-
-    freerdp* instance = freerdp_new();
-    if (!instance) {
-        fprintf(stderr, "freerdp_new() failed\n");
+    RDP_CLIENT_ENTRY_POINTS ep = { 0 };
+    ep.Size = sizeof(ep);
+    ep.Version = RDP_CLIENT_INTERFACE_VERSION;
+    if (RdpClientEntry(&ep) != 0) {
+        fprintf(stderr, "RdpClientEntry() failed\n");
         return 1;
     }
 
-    g_instance = instance;
-    signal(SIGINT, handle_sigint);
+    /* Подменяем ClientNew/ClientFree на наши обёртки. Родной X11 ClientNew
+     * вызовется внутри них и расставит xf_pre_connect/xf_post_connect,
+     * а мы поверх навесим логику моста — как и раньше */
+    orig_context_new  = ep.ClientNew;
+    orig_context_free = ep.ClientFree;
+    ep.ClientNew  = quic_wrapped_context_new;
+    ep.ClientFree = quic_wrapped_context_free;
 
-    instance->ContextSize = entry_points.ContextSize;
-    orig_context_new  = entry_points.ClientNew;
-    orig_context_free = entry_points.ClientFree;
-    instance->ContextNew  = quic_wrapped_context_new;
-    instance->ContextFree = quic_wrapped_context_free;
-
-    /* PreConnect/PostConnect/PostDisconnect тут НЕ выставляем — их
-     * расставит quic_wrapped_context_new после вызова оригинального
-     * X11 ContextNew */
-
-    if (!freerdp_context_new(instance)) {
-        fprintf(stderr, "freerdp_context_new() failed\n");
-        goto cleanup;
+    rdpContext* context = freerdp_client_context_new(&ep);
+    if (!context) {
+        fprintf(stderr, "freerdp_client_context_new() failed\n");
+        return 1;
     }
 
-    if (freerdp_client_settings_parse_command_line(
-            instance->context->settings, argc, argv, FALSE) < 0) {
+    g_instance = context->instance;
+    signal(SIGINT, handle_sigint);
+
+    if (freerdp_client_settings_parse_command_line(context->settings, argc, argv, FALSE) < 0) {
         fprintf(stderr, "Ошибка парсинга аргументов\n");
-        goto cleanup_context;
+        goto out;
     }
 
     fprintf(stderr, "[client] Подключаемся к %s...\n",
-            freerdp_settings_get_string(instance->context->settings,
-                                        FreeRDP_ServerHostname));
+            freerdp_settings_get_string(context->settings, FreeRDP_ServerHostname));
 
-    if (!freerdp_connect(instance)) {
-        fprintf(stderr, "[client] Не удалось подключиться\n");
-        goto cleanup_context;
+    /* Запускает xf_client_thread: он сам делает freerdp_connect и крутит
+     * полноценный цикл — RDP-события + события X-сервера (ввод, ресайз) */
+    if (freerdp_client_start(context) != 0) {
+        fprintf(stderr, "[client] freerdp_client_start() failed\n");
+        goto out;
     }
 
-    fprintf(stderr, "[client] Соединение установлено, запускаем основной цикл\n");
-
-    while (!freerdp_shall_disconnect_context(instance->context)) {
-        DWORD status = freerdp_check_event_handles(instance->context);
-        if (status == WAIT_FAILED) {
-            fprintf(stderr, "[client] freerdp_check_event_handles() failed\n");
-            break;
-        }
+    HANDLE thread = freerdp_client_get_thread(context);
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE);
+        DWORD code = 0;
+        GetExitCodeThread(thread, &code);
+        rc = (int)code;
     }
 
-    freerdp_disconnect(instance);
-    exit_code = 0;
+    freerdp_client_stop(context);
 
-cleanup_context:
-    freerdp_context_free(instance);
-cleanup:
-    freerdp_free(instance);
+    out:
+        freerdp_client_context_free(context);
     g_instance = NULL;
-    return exit_code;
+    return rc;
 }
