@@ -9,6 +9,8 @@
 #include <winpr/stream.h>
 #include "quic_bridge.h"
 #include "quic_transport.h"
+#include <freerdp/peer.h>
+#include <winpr/synch.h>
 
 
 #define TAG MODULE_TAG("quicmux")
@@ -55,6 +57,25 @@ static int quicmux_ps_write_pdu(rdpTransport* transport, wStream* s)
 	return 1;
 }
 
+/* Хендлы unix-сокетов моста для событийного цикла ps.
+ * Упрощение: одна активная сессия на процесс прокси. */
+static HANDLE g_bridge_events[QUIC_CHANNEL_COUNT] = { 0 };
+static DWORD (*g_orig_get_event_handles)(freerdp_peer*, HANDLE*, DWORD) = NULL;
+
+static DWORD quicmux_get_event_handles(freerdp_peer* peer, HANDLE* events, DWORD count)
+{
+	DWORD n = g_orig_get_event_handles(peer, events, count);
+	if (n == 0)
+		return 0; /* оригинал сигнализирует об ошибке нулём — пробрасываем */
+
+	for (int i = 0; i < QUIC_CHANNEL_COUNT && n < count; i++)
+	{
+		if (g_bridge_events[i])
+			events[n++] = g_bridge_events[i];
+	}
+	return n;
+}
+
 static int quicmux_ps_read_pdu(rdpTransport* transport, wStream* s)
 {
 	rdpContext* context = transport_get_context(transport);
@@ -78,7 +99,7 @@ static int quicmux_ps_read_pdu(rdpTransport* transport, wStream* s)
 		fds[i].revents = 0;
 	}
 
-	int ready = poll(fds, QUIC_CHANNEL_COUNT, 100);
+	int ready = poll(fds, QUIC_CHANNEL_COUNT, 0);
 	if (ready < 0)  return -1;
 	if (ready == 0) return 0;
 
@@ -131,6 +152,27 @@ static BOOL quicmux_server_post_connect(proxyPlugin* plugin, proxyData* pdata, v
 		WLog_ERR(TAG, "не удалось установить io callbacks на ps");
 		return FALSE;
 	}
+
+	freerdp_peer* peer = (freerdp_peer*)custom;
+	if (!peer)
+	{
+		WLog_ERR(TAG, "ServerPostConnect: нет freerdp_peer");
+		return FALSE;
+	}
+
+	for (int i = 0; i < QUIC_CHANNEL_COUNT; i++)
+	{
+		g_bridge_events[i] = CreateFileDescriptorEvent(NULL, FALSE, FALSE,
+							       data->bridge->fds[i], WINPR_FD_READ);
+		if (!g_bridge_events[i])
+		{
+			WLog_ERR(TAG, "не удалось создать хендл для канала %s", QUIC_CHANNEL_NAMES[i]);
+			return FALSE;
+		}
+	}
+
+	g_orig_get_event_handles = peer->GetEventHandles;
+	peer->GetEventHandles = quicmux_get_event_handles;
 
 	WLog_INFO(TAG, "транспорт ps перехвачен — графика/служебные PDU идут в мост");
 	return TRUE;
@@ -290,6 +332,16 @@ static BOOL quicmux_server_session_end(proxyPlugin* plugin, proxyData* pdata, vo
 	}
 	if (data->bridge)
 	{
+		for (int i = 0; i < QUIC_CHANNEL_COUNT; i++)
+		{
+			if (g_bridge_events[i])
+			{
+				CloseHandle(g_bridge_events[i]);
+				g_bridge_events[i] = NULL;
+			}
+		}
+		g_orig_get_event_handles = NULL;
+
 		quic_bridge_free(data->bridge);
 		data->bridge = NULL;
 	}
