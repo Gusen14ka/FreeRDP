@@ -109,6 +109,9 @@ static int quic_write_pdu(rdpTransport* transport, wStream* s)
     size_t len         = Stream_Length(s);
     if (len == 0) return 0;
 
+    fprintf(stderr, "[quic_write] first=0x%02x len=%zu -> %s\n",
+        buf[0], len, QUIC_CHANNEL_NAMES[quic_transport_classify_pdu(buf, len)]);
+
     QuicChannel ch = quic_transport_classify_pdu(buf, len);
 
     fprintf(stderr, "[quic_write] len=%-5zu channel=%s\n",
