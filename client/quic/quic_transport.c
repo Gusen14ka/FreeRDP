@@ -31,6 +31,10 @@
 #define QUIC_DATA_PDU_UPDATE     0x02
 #define QUIC_DATA_PDU_POINTER    0x1B
 
+#define QUIC_MCS_IO_CHANNEL 1003  /* основной канал RDP */
+#define QUIC_MCS_SDRQ       25    /* Send Data Request: клиент → сервер */
+#define QUIC_MCS_SDIN       26    /* Send Data Indication: сервер → клиент */
+
 /* Offsets в slow-path PDU */
 #define TPKT_X224_SIZE   7   /* TPKT(4) + X.224(3) */
 #define MCS_MIN_SIZE     8
@@ -51,6 +55,19 @@ QuicChannel quic_transport_classify_pdu(const uint8_t* buf, size_t len)
     /* Slow-path: TPKT header */
     if (first != 0x03)
         return QUIC_CHANNEL_CONTROL;
+
+    /* TPKT(4) + X.224(3), затем MCS: [7] тип, [8..9] initiator,
+     * [10..11] channelId (big-endian). Всё, что не на основном канале, —
+     * виртуальный канал целиком, независимо от размера: иначе PDU одного
+     * канала разъедутся по разным стримам и потеряют порядок */
+    if (len >= 12) {
+        uint8_t mcs_type = buf[7] >> 2;
+        if (mcs_type == QUIC_MCS_SDRQ || mcs_type == QUIC_MCS_SDIN) {
+            uint16_t chan = (uint16_t)((buf[10] << 8) | buf[11]);
+            if (chan != QUIC_MCS_IO_CHANNEL)
+                return QUIC_CHANNEL_VCHANNEL;
+        }
+    }
 
     /* Проверяем Security Flags */
     if (len >= (size_t)(SEC_HDR_OFFSET + 2)) {
