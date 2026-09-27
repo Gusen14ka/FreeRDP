@@ -15,6 +15,10 @@
 
 #define TAG MODULE_TAG("quicmux")
 
+/* MCS_GLOBAL_CHANNEL_ID: основной канал RDP. Всё остальное — виртуальные каналы */
+#define QUICMUX_MCS_IO_CHANNEL 1003
+#define QUICMUX_MCS_SDIN       26   /* Send Data Indication */
+
 typedef struct
 {
 	proxyPluginsManager* mgr;
@@ -27,6 +31,33 @@ static const char plugin_name[] = "quicmux";
 static const char plugin_desc[] = "Transport-level RDP demux into unix-socket channels for QUIC bridge";
 
 /* ===================== ps -> клиент: вся графика и служебные PDU ===================== */
+
+static QuicChannel quicmux_classify_server_pdu(const uint8_t* buf, size_t len)
+{
+	if (len < 2)
+		return QUIC_CHANNEL_CONTROL;
+
+	/* fast-path: сервер шлёт так только обновления экрана и курсора */
+	if ((buf[0] & 0x03) == 0x00)
+		return QUIC_CHANNEL_GRAPHICS;
+
+	if (buf[0] != 0x03)
+		return QUIC_CHANNEL_CONTROL;
+
+	/* slow-path: TPKT(4) + X.224(3), затем MCS:
+	 *   [7]      тип PDU (старшие 6 бит)
+	 *   [8..9]   initiator
+	 *   [10..11] channelId, big-endian */
+	if (len >= 12 && (buf[7] >> 2) == QUICMUX_MCS_SDIN)
+	{
+		const uint16_t chan = (uint16_t)((buf[10] << 8) | buf[11]);
+		if (chan != QUICMUX_MCS_IO_CHANNEL)
+			return QUIC_CHANNEL_VCHANNEL;
+	}
+
+	/* основной канал — прежняя классификация */
+	return quic_transport_classify_pdu(buf, len);
+}
 
 static int quicmux_ps_write_pdu(rdpTransport* transport, wStream* s)
 {
@@ -45,7 +76,7 @@ static int quicmux_ps_write_pdu(rdpTransport* transport, wStream* s)
 	if ((buf[0] & 0x03) == 0x00)
 		ch = QUIC_CHANNEL_GRAPHICS;
 	else
-		ch = quic_transport_classify_pdu(buf, len);
+		ch = quicmux_classify_server_pdu(buf, len);
 
 	if (quic_bridge_write(bridge, ch, buf, (uint32_t)len) < 0)
 	{
