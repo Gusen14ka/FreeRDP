@@ -2,6 +2,8 @@
 
 #include <freerdp/transport_io.h>
 #include <freerdp/freerdp.h>
+#include <winpr/wlog.h>
+#include <freerdp/log.h>
 
 #include <poll.h>
 #include <string.h>
@@ -9,6 +11,8 @@
 
 /* Реальные константы из публичных заголовков */
 #include <freerdp/crypto/er.h>
+
+#define TAG CLIENT_TAG("quic")
 
 /* SEC_* константы нужны для классификации PDU.
  * Они в rdp.h который внутренний.
@@ -109,12 +113,12 @@ static int quic_write_pdu(rdpTransport* transport, wStream* s)
     size_t len         = Stream_Length(s);
     if (len == 0) return 0;
 
-    fprintf(stderr, "[quic_write] first=0x%02x len=%zu -> %s\n",
-        buf[0], len, QUIC_CHANNEL_NAMES[quic_transport_classify_pdu(buf, len)]);
+    // fprintf(stderr, "[quic_write] first=0x%02x len=%zu -> %s\n",
+    //     buf[0], len, QUIC_CHANNEL_NAMES[quic_transport_classify_pdu(buf, len)]);
 
     QuicChannel ch = quic_transport_classify_pdu(buf, len);
 
-    fprintf(stderr, "[quic_write] len=%-5zu channel=%s\n",
+    WLog_DBG(TAG, "[quic_write] len=%-5zu channel=%s\n",
             len, QUIC_CHANNEL_NAMES[ch]);
 
     if (quic_bridge_write(bridge, ch, buf, (uint32_t)len) < 0)
@@ -174,7 +178,7 @@ static int quic_read_pdu(rdpTransport* transport, wStream* s)
         Stream_SealLength(s);
         Stream_ResetPosition(s);
 
-        fprintf(stderr, "[quic_read] channel=%-9s len=%d\n", QUIC_CHANNEL_NAMES[ch], n);
+        WLog_DBG(TAG, "[quic_read] channel=%-9s len=%d\n", QUIC_CHANNEL_NAMES[ch], n);
         return n;
     }
     return 0;
