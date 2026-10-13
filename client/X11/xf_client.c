@@ -105,6 +105,7 @@
 #include "xf_client.h"
 #include "xfreerdp.h"
 #include "xf_utils.h"
+#include "quic_trace.h" /* трасса PDU по RDP_TRACE (client/quic) */
 
 #include <freerdp/log.h>
 #define TAG CLIENT_TAG("x11")
@@ -1173,6 +1174,10 @@ static BOOL xf_pre_connect(freerdp* instance)
 	WINPR_ASSERT(context);
 	xfContext* xfc = (xfContext*)context;
 
+	/* Трасса PDU: включается переменной RDP_TRACE, иначе ничего не делает */
+	if (!quic_trace_pre_connect(instance))
+		return FALSE;
+
 	rdpSettings* settings = context->settings;
 	WINPR_ASSERT(settings);
 
@@ -1482,6 +1487,7 @@ static BOOL xf_post_connect(freerdp* instance)
 	    WINPR_ASSERTING_INT_CAST(int, freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth));
 	e.height =
 	    WINPR_ASSERTING_INT_CAST(int, freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
+	quic_trace_post_connect(instance);
 	return PubSub_OnResizeWindow(context->pubSub, xfc, &e) >= 0;
 }
 
@@ -1489,6 +1495,8 @@ static void xf_post_disconnect(freerdp* instance)
 {
 	xfContext* xfc = nullptr;
 	rdpContext* context = nullptr;
+
+	quic_trace_close();
 
 	if (!instance || !instance->context)
 		return;

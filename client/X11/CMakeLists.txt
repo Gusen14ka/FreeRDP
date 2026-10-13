@@ -36,6 +36,7 @@ include(ConfigureFreeRDP)
 find_package(X11 REQUIRED)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../resources)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../quic)
 include_directories(SYSTEM ${X11_INCLUDE_DIRS})
 include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR})
 
@@ -79,6 +80,12 @@ set(SRCS
     xf_window.h
     xf_client.c
     xf_client.h
+    # трасса PDU (RDP_TRACE) — код лежит рядом с QUIC-частью форка
+    ../quic/quic_trace.c
+    ../quic/quic_trace.h
+    ../quic/quic_trace_writer.c
+    ../quic/quic_trace_writer.h
+    ../quic/quic_classify.h
 )
 
 if(CHANNEL_TSMF_CLIENT)
