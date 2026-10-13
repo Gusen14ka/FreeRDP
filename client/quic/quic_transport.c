@@ -1,4 +1,5 @@
 #include "quic_transport.h"
+#include "quic_classify.h"
 
 #include <freerdp/transport_io.h>
 #include <freerdp/freerdp.h>
@@ -9,108 +10,14 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Реальные константы из публичных заголовков */
-#include <freerdp/crypto/er.h>
 
 #define TAG CLIENT_TAG("quic")
 
-/* SEC_* константы нужны для классификации PDU.
- * Они в rdp.h который внутренний.
- * Определяем только те что нам нужны — они не изменятся,
- * это часть протокола RDP зафиксированная в MS-RDPBCGR */
-#define QUIC_SEC_EXCHANGE_PKT    0x0001
-#define QUIC_SEC_INFO_PKT        0x0040
-#define QUIC_SEC_LICENSE_PKT     0x0080
-#define QUIC_SEC_AUTODETECT_REQ  0x1000
-#define QUIC_SEC_AUTODETECT_RSP  0x2000
-#define QUIC_SEC_HEARTBEAT       0x4000
-
-#define QUIC_PDU_TYPE_DATA       0x07
-
-#define QUIC_DATA_PDU_INPUT      0x1C
-#define QUIC_DATA_PDU_UPDATE     0x02
-#define QUIC_DATA_PDU_POINTER    0x1B
-
-#define QUIC_MCS_IO_CHANNEL 1003  /* основной канал RDP */
-#define QUIC_MCS_SDRQ       25    /* Send Data Request: клиент → сервер */
-#define QUIC_MCS_SDIN       26    /* Send Data Indication: сервер → клиент */
-
-/* Offsets в slow-path PDU */
-#define TPKT_X224_SIZE   7   /* TPKT(4) + X.224(3) */
-#define MCS_MIN_SIZE     8
-#define SEC_HDR_OFFSET   (TPKT_X224_SIZE + MCS_MIN_SIZE)
-#define SHARE_CTRL_OFFSET (SEC_HDR_OFFSET + 2)
-
+/* Классификация вынесена в общий quic_classify.h (одна на клиент,
+ * прокси и трассировщик). Эта функция оставлена для совместимости API. */
 QuicChannel quic_transport_classify_pdu(const uint8_t* buf, size_t len)
 {
-    if (len < 2) return QUIC_CHANNEL_CONTROL;
-
-    uint8_t first = buf[0];
-
-    /* Fast-path: биты 0-1 = 0x00
-     * На клиентской стороне fast-path = input events */
-    if ((first & 0x03) == 0x00)
-        return QUIC_CHANNEL_INPUT;
-
-    /* Slow-path: TPKT header */
-    if (first != 0x03)
-        return QUIC_CHANNEL_CONTROL;
-
-    /* TPKT(4) + X.224(3), затем MCS: [7] тип, [8..9] initiator,
-     * [10..11] channelId (big-endian). Всё, что не на основном канале, —
-     * виртуальный канал целиком, независимо от размера: иначе PDU одного
-     * канала разъедутся по разным стримам и потеряют порядок */
-    if (len >= 12) {
-        uint8_t mcs_type = buf[7] >> 2;
-        if (mcs_type == QUIC_MCS_SDRQ || mcs_type == QUIC_MCS_SDIN) {
-            uint16_t chan = (uint16_t)((buf[10] << 8) | buf[11]);
-            if (chan != QUIC_MCS_IO_CHANNEL)
-                return QUIC_CHANNEL_VCHANNEL;
-        }
-    }
-
-    /* Проверяем Security Flags */
-    if (len >= (size_t)(SEC_HDR_OFFSET + 2)) {
-        uint16_t sec = (uint16_t)(buf[SEC_HDR_OFFSET] |
-                      (buf[SEC_HDR_OFFSET + 1] << 8));
-
-        if (sec & (QUIC_SEC_EXCHANGE_PKT  |
-                   QUIC_SEC_INFO_PKT      |
-                   QUIC_SEC_LICENSE_PKT   |
-                   QUIC_SEC_AUTODETECT_REQ|
-                   QUIC_SEC_AUTODETECT_RSP|
-                   QUIC_SEC_HEARTBEAT))
-            return QUIC_CHANNEL_CONTROL;
-    }
-
-    /* Share Control Header */
-    if (len >= (size_t)(SHARE_CTRL_OFFSET + 6)) {
-        uint16_t pdu_type = (uint16_t)(buf[SHARE_CTRL_OFFSET + 2] |
-                            (buf[SHARE_CTRL_OFFSET + 3] << 8));
-        pdu_type &= 0x0F;
-
-        if (pdu_type == QUIC_PDU_TYPE_DATA) {
-            /* Share Data Header: +9 байт от начала Share Control */
-            size_t data_type_off = SHARE_CTRL_OFFSET + 6 + 9;
-            if (len > data_type_off) {
-                uint8_t data_type = buf[data_type_off];
-                if (data_type == QUIC_DATA_PDU_INPUT)
-                    return QUIC_CHANNEL_INPUT;
-                if (data_type == QUIC_DATA_PDU_UPDATE ||
-                    data_type == QUIC_DATA_PDU_POINTER)
-                    return QUIC_CHANNEL_GRAPHICS;
-            }
-            return QUIC_CHANNEL_CONTROL;
-        }
-
-        /* Не DATA — служебный */
-        return QUIC_CHANNEL_CONTROL;
-    }
-
-    /* Виртуальный канал — MCS channelId != GLOBAL */
-    if (len > 100) return QUIC_CHANNEL_VCHANNEL;
-
-    return QUIC_CHANNEL_CONTROL;
+    return quic_classify_client_pdu(buf, len);
 }
 
 /* ── WritePdu ─────────────────────────────────────────────────── */
