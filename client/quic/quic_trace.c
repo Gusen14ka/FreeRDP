@@ -4,6 +4,7 @@
 #include "quic_trace.h"        /* наш публичный интерфейс */
 #include "quic_trace_writer.h" /* запись CSV */
 #include "quic_classify.h"     /* та же классификация, что у форка */
+#include "quic_arm.h"          /* старт записи по SIGUSR1 (RDP_CAPTURE_ARM=signal) */
 
 #include <freerdp/channels/channels.h> /* freerdp_channels_get_id_by_name */
 #include <freerdp/settings.h>          /* чтение настроек подключения */
@@ -28,6 +29,24 @@ static unsigned long long g_write_len_mismatch = 0;
 
 /* ── Обёртки над ReadPdu / WritePdu ───────────────────────────── */
 
+/* Время записи в мкс, или -1, если писать пока нельзя (ждём SIGUSR1).
+ * В режиме RDP_CAPTURE_ARM=signal ноль времени — момент сигнала,
+ * иначе — открытие трассы. */
+static int64_t trace_time_us(void)
+{
+	if (!quic_arm_is_armed())
+		return -1; /* сигнал ещё не пришёл — PDU не пишем */
+	if (!quic_arm_signal_mode())
+		return (int64_t)quic_trace_writer_now_us(g_trace); /* обычный режим */
+	static int noted = 0; /* отметить в файле момент старта один раз */
+	if (!noted)
+	{
+		noted = 1;
+		quic_trace_writer_comment(g_trace, "armed: t_us отсчитывается от SIGUSR1");
+	}
+	return (int64_t)((quic_arm_now_ns() - quic_arm_t0_ns()) / 1000u);
+}
+
 /* Чтение: сначала стандартная функция читает PDU из сети, потом мы его записываем */
 static int trace_read_pdu(rdpTransport* transport, wStream* s)
 {
@@ -37,8 +56,9 @@ static int trace_read_pdu(rdpTransport* transport, wStream* s)
 		/* Стандартный ReadPdu оставляет в s ровно одно целое PDU */
 		const uint8_t* buf = Stream_Buffer(s); /* начало PDU */
 		const size_t len = Stream_Length(s);   /* его длина */
-		const uint64_t t = quic_trace_writer_now_us(g_trace); /* время прихода */
-		quic_trace_writer_record(g_trace, t, 'd', /* 'd' — сервер -> клиент */
+		const int64_t t = trace_time_us(); /* время прихода; -1 — ещё не пишем */
+		if (t >= 0)
+			quic_trace_writer_record(g_trace, (uint64_t)t, 'd', /* 'd' — сервер -> клиент */
 		                         QUIC_CHANNEL_NAMES[quic_classify_server_pdu(buf, len)],
 		                         quic_pdu_mcs_channel(buf, len), (uint32_t)len);
 	}
@@ -55,8 +75,9 @@ static int trace_write_pdu(rdpTransport* transport, wStream* s)
 		if (len > 0)
 		{
 			const uint8_t* buf = Stream_Buffer(s); /* начало PDU */
-			const uint64_t t = quic_trace_writer_now_us(g_trace); /* время отправки */
-			quic_trace_writer_record(g_trace, t, 'u', /* 'u' — клиент -> сервер */
+			const int64_t t = trace_time_us(); /* время отправки; -1 — ещё не пишем */
+			if (t >= 0)
+				quic_trace_writer_record(g_trace, (uint64_t)t, 'u', /* 'u' — клиент -> сервер */
 			                         QUIC_CHANNEL_NAMES[quic_classify_client_pdu(buf, len)],
 			                         quic_pdu_mcs_channel(buf, len), (uint32_t)len);
 			if (Stream_Length(s) != len)
@@ -73,6 +94,8 @@ BOOL quic_trace_pre_connect(freerdp* instance)
 	const char* path = getenv("RDP_TRACE"); /* куда писать трассу */
 	if (!path || !*path || g_trace)
 		return TRUE; /* трасса не запрошена (или уже открыта) — ничего не делаем */
+
+	quic_arm_init(); /* RDP_CAPTURE_ARM=signal — ждать SIGUSR1 перед записью */
 
 	rdpContext* context = instance->context;
 	const rdpTransportIo* defaults = freerdp_get_io_callbacks(context); /* текущие колбэки транспорта */

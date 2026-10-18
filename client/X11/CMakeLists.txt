@@ -91,6 +91,9 @@ set(SRCS
     ../quic/quic_input.h
     ../quic/quic_input_script.c
     ../quic/quic_input_script.h
+    # общий старт записи по SIGUSR1 (RDP_CAPTURE_ARM=signal)
+    ../quic/quic_arm.c
+    ../quic/quic_arm.h
 )
 
 if(CHANNEL_TSMF_CLIENT)

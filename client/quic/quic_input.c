@@ -21,6 +21,7 @@
 
 #include "quic_input.h"
 #include "quic_input_script.h"
+#include "quic_arm.h" /* старт по SIGUSR1 (RDP_CAPTURE_ARM=signal) */
 
 #include <freerdp/input.h>        /* rdpInput, freerdp_input_send_* */
 #include <freerdp/settings.h>     /* размер экрана для шапки файла */
@@ -77,14 +78,21 @@ static uint64_t mono_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Ноль времени для ввода: в режиме RDP_CAPTURE_ARM=signal — момент SIGUSR1,
+ * иначе — активация сессии */
+static uint64_t base_ns(void)
+{
+	return quic_arm_signal_mode() ? quic_arm_t0_ns() : g_t0_ns;
+}
+
 /* ── Запись одного события ────────────────────────────────────── */
 
 static void record(QuicInputType type, uint32_t flags, int32_t a, int32_t b)
 {
 	pthread_mutex_lock(&g_lock); /* события идут из разных потоков */
-	if (g_rec && g_active)
+	if (g_rec && g_active && quic_arm_is_armed()) /* до SIGUSR1 ввод не пишем */
 	{
-		const QuicInputEvent ev = { .t_us = (mono_ns() - g_t0_ns) / 1000u,
+		const QuicInputEvent ev = { .t_us = (mono_ns() - base_ns()) / 1000u,
 			                        .type = type, .flags = flags, .a = a, .b = b };
 		char line[128];
 		if (quic_input_format_line(&ev, line, sizeof line) > 0)
@@ -175,9 +183,17 @@ static void* play_thread(void* arg)
 {
 	(void)arg;
 	rdpInput* in = g_context->input;
+	/* В режиме RDP_CAPTURE_ARM=signal ждём SIGUSR1: повтор стартует из того же
+	 * состояния экрана, что и запись (скрипт шлёт сигнал по готовности сессии) */
+	while (!quic_arm_is_armed() && !atomic_load(&g_stop))
+	{
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 }; /* проверка каждые 2 мс */
+		nanosleep(&ts, NULL);
+	}
+	const uint64_t base = base_ns(); /* ноль времени для повтора */
 	for (size_t i = 0; i < g_script_len && !atomic_load(&g_stop); i++)
 	{
-		const uint64_t due_ns = g_t0_ns + g_script[i].t_us * 1000u; /* когда отправить */
+		const uint64_t due_ns = base + g_script[i].t_us * 1000u; /* когда отправить */
 		/* Спим кусками не длиннее 100 мс, чтобы быстро реагировать на остановку */
 		for (;;)
 		{
@@ -314,6 +330,8 @@ BOOL quic_input_pre_connect(freerdp* instance)
 	const BOOL want_play = play_path && *play_path;
 	if (!want_rec && !want_play)
 		return TRUE; /* ничего не запрошено — клиент работает как обычно */
+
+	quic_arm_init(); /* RDP_CAPTURE_ARM=signal — ждать SIGUSR1 перед записью/повтором */
 
 	g_context = instance->context;
 
