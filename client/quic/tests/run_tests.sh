@@ -10,7 +10,9 @@ OUT=$(mktemp -d)       # временная папка для бинарнико
 CFLAGS="-std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I$Q"
 cc $CFLAGS test_classify.c -o "$OUT/test_classify"                              # классификатор — только заголовок
 cc $CFLAGS -pthread test_trace_writer.c "$Q/quic_trace_writer.c" -o "$OUT/test_trace_writer"  # запись + pthread
+cc $CFLAGS test_input_script.c "$Q/quic_input_script.c" -o "$OUT/test_input_script"         # формат файла ввода
 echo "== классификатор";   "$OUT/test_classify"
 echo "== запись трассы";   "$OUT/test_trace_writer"
+echo "== файл ввода";      "$OUT/test_input_script"
 rm -rf "$OUT"          # убрать временные бинарники
 echo "== все тесты пройдены"

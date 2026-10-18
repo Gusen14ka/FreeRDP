@@ -106,6 +106,7 @@
 #include "xfreerdp.h"
 #include "xf_utils.h"
 #include "quic_trace.h" /* трасса PDU по RDP_TRACE (client/quic) */
+#include "quic_input.h" /* запись/воспроизведение ввода по RDP_INPUT_RECORD/SCRIPT */
 
 #include <freerdp/log.h>
 #define TAG CLIENT_TAG("x11")
@@ -1177,6 +1178,9 @@ static BOOL xf_pre_connect(freerdp* instance)
 	/* Трасса PDU: включается переменной RDP_TRACE, иначе ничего не делает */
 	if (!quic_trace_pre_connect(instance))
 		return FALSE;
+	/* Запись/воспроизведение ввода: строго после трассы (цепочка WritePdu) */
+	if (!quic_input_pre_connect(instance))
+		return FALSE;
 
 	rdpSettings* settings = context->settings;
 	WINPR_ASSERT(settings);
@@ -1496,6 +1500,7 @@ static void xf_post_disconnect(freerdp* instance)
 	xfContext* xfc = nullptr;
 	rdpContext* context = nullptr;
 
+	quic_input_close(); /* сначала остановить воспроизведение ввода */
 	quic_trace_close();
 
 	if (!instance || !instance->context)

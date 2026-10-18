@@ -86,6 +86,11 @@ set(SRCS
     ../quic/quic_trace_writer.c
     ../quic/quic_trace_writer.h
     ../quic/quic_classify.h
+    # запись/воспроизведение ввода (RDP_INPUT_RECORD / RDP_INPUT_SCRIPT)
+    ../quic/quic_input.c
+    ../quic/quic_input.h
+    ../quic/quic_input_script.c
+    ../quic/quic_input_script.h
 )
 
 if(CHANNEL_TSMF_CLIENT)
